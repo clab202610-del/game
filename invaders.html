@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>인베이더</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #000; overflow: hidden; }
+  body {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-family: "Courier New", monospace; color: #fff; user-select: none; -webkit-user-select: none;
+  }
+  #wrap { position: relative; }
+  canvas {
+    display: block; image-rendering: pixelated; image-rendering: crisp-edges;
+    background: #000; border: 2px solid #1a1a1a;
+  }
+  #touch {
+    display: none; width: 100%; max-width: 672px; gap: 10px; padding: 10px; justify-content: space-between;
+  }
+  #touch button {
+    flex: 1; height: 64px; font-size: 26px; font-family: inherit; font-weight: bold;
+    background: #111; color: #3f3; border: 2px solid #3f3; border-radius: 10px; touch-action: none;
+  }
+  #touch button:active { background: #3f3; color: #000; }
+  #touch #fire { flex: 1.4; color: #f44; border-color: #f44; }
+  #touch #fire:active { background: #f44; color: #000; }
+  @media (pointer: coarse) { #touch { display: flex; } }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="672" height="768"></canvas></div>
+<div id="touch">
+  <button id="left">◀</button>
+  <button id="fire">발사</button>
+  <button id="right">▶</button>
+</div>
+<script>
+(() => {
+  // ===== 기본 설정 =====
+  const W = 224, H = 256;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.scale(3, 3); ctx.imageSmoothingEnabled = false; // 3배 해상도로 그려서 글자를 선명하게
+
+  function resize() {
+    const touchH = matchMedia('(pointer: coarse)').matches ? 90 : 0;
+    const scale = Math.max(1, Math.min((innerWidth - 8) / W, (innerHeight - 8 - touchH) / H));
+    canvas.style.width = Math.floor(W * scale) + 'px';
+    canvas.style.height = Math.floor(H * scale) + 'px';
+  }
+  addEventListener('resize', resize); resize();
+
+  // ===== 픽셀 스프라이트 (오리지널 디자인) =====
+  const SPRITES = {
+    // 위쪽 줄: 작은 오징어형 (30점)
+    a1: ["...##...","..####..",".######.","##.##.##","########","..#..#..",".#.##.#.","#.#..#.#"],
+    a2: ["...##...","..####..",".######.","##.##.##","########",".#.##.#.","#......#",".#....#."],
+    // 가운데 줄: 게형 (20점)
+    b1: ["..#.....#..","...#...#...","..#######..",".##.###.##.","###########","#.#######.#","#.#.....#.#","...##.##..."],
+    b2: ["..#.....#..","#..#...#..#","#.#######.#","###.###.###","###########",".#########.","..#.....#..",".#.......#."],
+    // 아래쪽 줄: 문어형 (10점)
+    c1: ["....####....",".##########.","############","###..##..###","############","...##..##...","..##.##.##..","##........##"],
+    c2: ["....####....",".##########.","############","###..##..###","############","..###..###..",".##..##..##.","..##....##.."],
+    player: [".....#.....","....###....","....###....",".#########.","###########","###########","###########"],
+    ufo: [".....######.....","...##########...","..############..",".##.##.##.##.##.","################","..###..##..###..","...#........#..."],
+    boom: ["#...#..#...#",".#...##...#.","..#......#..","##........##","..#......#..",".#...##...#.","#...#..#...#"],
+  };
+  const spriteCache = {};
+  function sprite(name, color) {
+    const key = name + color;
+    if (spriteCache[key]) return spriteCache[key];
+    const rows = SPRITES[name];
+    const c = document.createElement('canvas');
+    c.width = rows[0].length; c.height = rows.length;
+    const g = c.getContext('2d'); g.fillStyle = color;
+    rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch === '#') g.fillRect(x, y, 1, 1); }));
+    return (spriteCache[key] = c);
+  }
+
+  // ===== 사운드 (Web Audio) =====
+  let actx = null, muted = false;
+  function audio() {
+    if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (actx && actx.state === 'suspended') actx.resume();
+    return actx;
+  }
+  function tone(freq, dur, type = 'square', vol = 0.08, slideTo = null) {
+    if (muted) return; const a = audio(); if (!a) return;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function noise(dur, vol = 0.12) {
+    if (muted) return; const a = audio(); if (!a) return;
+    const buf = a.createBuffer(1, a.sampleRate * dur, a.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length);
+    const s = a.createBufferSource(), g = a.createGain();
+    s.buffer = buf; g.gain.value = vol; s.connect(g); g.connect(a.destination); s.start();
+  }
+  const SFX = {
+    shoot: () => tone(880, 0.12, 'square', 0.05, 220),
+    kill: () => noise(0.15, 0.1),
+    die: () => { noise(0.6, 0.18); tone(200, 0.6, 'sawtooth', 0.06, 40); },
+    march: (i) => tone([110, 98, 87, 82][i % 4], 0.08, 'square', 0.07),
+    ufo: () => tone(1200, 0.08, 'sine', 0.03, 900),
+    ufoHit: () => tone(300, 0.4, 'square', 0.06, 1500),
+  };
+
+  // ===== 최고 점수 저장 =====
+  let hiScore = 0;
+  try { hiScore = +localStorage.getItem('invaders-hi') || 0; } catch (e) {}
+  function saveHi() { try { localStorage.setItem('invaders-hi', hiScore); } catch (e) {} }
+
+  // ===== 상태 =====
+  const COLORS = { a: '#f5f', b: '#5ff', c: '#5f5', player: '#3f3', ufo: '#f33', shield: '#3f3', text: '#fff' };
+  const GROUND = 238;
+  let state = 'title'; // title | play | dying | levelclear | over | paused
+  let score, lives, level, player, aliens, alienDir, alienStepTimer, alienStepInterval, animFrame, marchIdx;
+  let pBullet = null, aBullets = [], explosions = [], shields = [], ufo = null, ufoTimer = 0, stateTimer = 0, frame = 0;
+  score = 0; lives = 3; level = 1; aliens = [];
+
+  const keys = {};
+
+  function newGame() {
+    score = 0; lives = 3; level = 1;
+    startLevel(); state = 'play';
+  }
+
+  function startLevel() {
+    player = { x: W / 2 - 5, y: 216, w: 11, h: 7, cooldown: 0 };
+    pBullet = null; aBullets = []; explosions = [];
+    aliens = [];
+    const top = 48 + Math.min(level - 1, 6) * 6;
+    for (let r = 0; r < 5; r++) {
+      const type = r === 0 ? 'a' : r < 3 ? 'b' : 'c';
+      for (let c = 0; c < 11; c++) {
+        const w = type === 'a' ? 8 : type === 'b' ? 11 : 12;
+        aliens.push({ type, x: 26 + c * 16 + (12 - w) / 2, y: top + r * 16, w, h: 8, alive: true,
+          points: type === 'a' ? 30 : type === 'b' ? 20 : 10 });
+      }
+    }
+    alienDir = 1; alienStepTimer = 0; animFrame = 0; marchIdx = 0;
+    ufo = null; ufoTimer = 600 + Math.random() * 600;
+    buildShields();
+  }
+
+  function buildShields() {
+    shields = [];
+    const shape = [
+      "....############....",
+      "...##############...",
+      "..################..",
+      ".##################.",
+      "####################",
+      "####################",
+      "####################",
+      "####################",
+      "######........######",
+      "#####..........#####",
+      "####............####",
+    ];
+    for (let i = 0; i < 4; i++) {
+      const sx = 30 + i * 46, sy = 186;
+      shape.forEach((row, y) => [...row].forEach((ch, x) => {
+        if (ch === '#') shields.push({ x: sx + x, y: sy + y, alive: true });
+      }));
+    }
+    // 빠른 충돌 판정용 그리드
+    shieldGrid = new Map();
+    shields.forEach(p => shieldGrid.set(p.x + ',' + p.y, p));
+  }
+  let shieldGrid = new Map();
+
+  function damageShield(bx, by, radius) {
+    let hit = false;
+    for (let dx = -radius; dx <= radius; dx++) for (let dy = -radius; dy <= radius; dy++) {
+      if (Math.random() < 0.3 && (Math.abs(dx) === radius || Math.abs(dy) === radius)) continue;
+      const p = shieldGrid.get((bx + dx) + ',' + (by + dy));
+      if (p && p.alive) { p.alive = false; hit = true; }
+    }
+    return hit;
+  }
+  function shieldAt(x, y, w, h) {
+    for (let ix = Math.floor(x); ix < x + w; ix++) for (let iy = Math.floor(y); iy < y + h; iy++) {
+      const p = shieldGrid.get(ix + ',' + iy);
+      if (p && p.alive) return p;
+    }
+    return null;
+  }
+
+  const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  // ===== 업데이트 =====
+  function update() {
+    frame++;
+    explosions = explosions.filter(e => --e.t > 0);
+
+    if (state === 'dying') {
+      if (--stateTimer <= 0) {
+        if (lives <= 0) { state = 'over'; if (score > hiScore) { hiScore = score; saveHi(); } }
+        else { player.x = W / 2 - 5; aBullets = []; state = 'play'; }
+      }
+      return;
+    }
+    if (state === 'levelclear') {
+      if (--stateTimer <= 0) { level++; startLevel(); state = 'play'; }
+      return;
+    }
+    if (state !== 'play') return;
+
+    // 플레이어 이동
+    const speed = 1.4;
+    if (keys.left) player.x -= speed;
+    if (keys.right) player.x += speed;
+    player.x = Math.max(4, Math.min(W - player.w - 4, player.x));
+    if (player.cooldown > 0) player.cooldown--;
+    if (keys.fire && !pBullet && player.cooldown === 0) {
+      pBullet = { x: player.x + 5, y: player.y - 4, w: 1, h: 4 };
+      player.cooldown = 8; SFX.shoot();
+    }
+
+    // 플레이어 총알
+    if (pBullet) {
+      pBullet.y -= 5;
+      if (pBullet.y < 20) { explosions.push({ x: pBullet.x - 4, y: 20, t: 10, kind: 'small', color: '#f33' }); pBullet = null; }
+      else if (shieldAt(pBullet.x, pBullet.y, 1, 4)) { damageShield(pBullet.x, pBullet.y + 2, 2); pBullet = null; }
+      else {
+        for (const a of aliens) if (a.alive && overlap(pBullet, a)) {
+          a.alive = false; score += a.points; pBullet = null; SFX.kill();
+          explosions.push({ x: a.x + a.w / 2 - 6, y: a.y, t: 14, kind: 'boom', color: COLORS[a.type] });
+          break;
+        }
+        if (pBullet) for (let i = 0; i < aBullets.length; i++) {
+          const b = aBullets[i];
+          if (overlap({ x: pBullet.x - 1, y: pBullet.y, w: 3, h: 4 }, b)) {
+            explosions.push({ x: b.x - 4, y: b.y, t: 8, kind: 'small', color: '#fff' });
+            aBullets.splice(i, 1); pBullet = null; break;
+          }
+        }
+        if (pBullet && ufo && overlap(pBullet, ufo)) {
+          const pts = [50, 100, 150, 300][Math.floor(Math.random() * 4)];
+          score += pts; SFX.ufoHit();
+          explosions.push({ x: ufo.x, y: ufo.y, t: 50, kind: 'text', text: String(pts), color: COLORS.ufo });
+          ufo = null; pBullet = null;
+        }
+      }
+    }
+
+    // 외계인 행진 — 남은 수가 적을수록, 레벨이 높을수록 빨라짐
+    const alive = aliens.filter(a => a.alive);
+    if (alive.length === 0) {
+      state = 'levelclear'; stateTimer = 120; pBullet = null; aBullets = []; return;
+    }
+    alienStepInterval = Math.max(2, Math.floor(alive.length / 1.4) - (level - 1) * 2);
+    if (++alienStepTimer >= alienStepInterval) {
+      alienStepTimer = 0; animFrame ^= 1; SFX.march(marchIdx++);
+      const minX = Math.min(...alive.map(a => a.x)), maxX = Math.max(...alive.map(a => a.x + a.w));
+      const stepX = 2;
+      if ((alienDir > 0 && maxX + stepX > W - 6) || (alienDir < 0 && minX - stepX < 6)) {
+        alienDir *= -1; alive.forEach(a => a.y += 8);
+      } else alive.forEach(a => a.x += stepX * alienDir);
+      // 외계인이 방어막을 지나가면 갉아먹음
+      alive.forEach(a => { if (a.y + a.h >= 186) for (let x = a.x; x < a.x + a.w; x++) for (let y = a.y; y < a.y + a.h; y++) {
+        const p = shieldGrid.get(Math.floor(x) + ',' + Math.floor(y)); if (p) p.alive = false; } });
+      if (Math.max(...alive.map(a => a.y + a.h)) >= player.y) { lives = 0; killPlayer(); return; }
+    }
+
+    // 외계인 사격 (각 열의 가장 아래 외계인만)
+    const maxBullets = Math.min(3 + Math.floor(level / 2), 6);
+    if (aBullets.length < maxBullets && Math.random() < 0.02 + level * 0.004) {
+      const cols = {};
+      alive.forEach(a => { const k = Math.round(a.x / 16); if (!cols[k] || a.y > cols[k].y) cols[k] = a; });
+      const shooters = Object.values(cols);
+      // 절반 확률로 플레이어 머리 위의 외계인이 쏨
+      let s = shooters[Math.floor(Math.random() * shooters.length)];
+      if (Math.random() < 0.5) {
+        const near = shooters.reduce((best, a) => Math.abs(a.x - player.x) < Math.abs(best.x - player.x) ? a : best);
+        s = near;
+      }
+      aBullets.push({ x: s.x + s.w / 2, y: s.y + s.h, w: 3, h: 7, vy: 1.6 + Math.random() * 0.8 + level * 0.1, style: Math.floor(Math.random() * 2) });
+    }
+    for (let i = aBullets.length - 1; i >= 0; i--) {
+      const b = aBullets[i]; b.y += b.vy;
+      if (b.y > GROUND - 4) { explosions.push({ x: b.x - 4, y: GROUND - 6, t: 10, kind: 'small', color: '#3f3' }); aBullets.splice(i, 1); continue; }
+      if (shieldAt(b.x, b.y, 3, 7)) { damageShield(Math.floor(b.x + 1), Math.floor(b.y + 6), 2); aBullets.splice(i, 1); continue; }
+      if (overlap(b, player)) { aBullets.splice(i, 1); killPlayer(); return; }
+    }
+
+    // UFO
+    if (!ufo && --ufoTimer <= 0 && alive.length > 6) {
+      const fromLeft = Math.random() < 0.5;
+      ufo = { x: fromLeft ? -16 : W, y: 30, w: 16, h: 7, vx: fromLeft ? 0.7 : -0.7 };
+      ufoTimer = 900 + Math.random() * 900;
+    }
+    if (ufo) {
+      ufo.x += ufo.vx;
+      if (frame % 8 === 0) SFX.ufo();
+      if (ufo.x < -20 || ufo.x > W + 4) ufo = null;
+    }
+
+    // 1만 점마다 보너스 생명
+    if (score >= nextBonus) { lives++; nextBonus += 10000; tone(660, 0.3, 'triangle', 0.08, 1320); }
+  }
+  let nextBonus = 10000;
+
+  function killPlayer() {
+    lives--; SFX.die(); state = 'dying'; stateTimer = 110; pBullet = null;
+    explosions.push({ x: player.x, y: player.y, t: 100, kind: 'player' });
+  }
+
+  // ===== 그리기 =====
+  function text(str, x, y, color = '#fff', align = 'left', size = 8) {
+    ctx.fillStyle = color; ctx.font = `bold ${size}px "Courier New", monospace`;
+    ctx.textAlign = align; ctx.textBaseline = 'top'; ctx.fillText(str, x, y);
+  }
+  const pad = (n) => String(n).padStart(5, '0');
+
+  function draw() {
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+
+    // 헤더
+    text('SCORE', 8, 4, '#aaa'); text(pad(score ?? 0), 8, 13);
+    text('HI-SCORE', W / 2, 4, '#aaa', 'center'); text(pad(Math.max(hiScore, score ?? 0)), W / 2, 13, '#fff', 'center');
+    if (state !== 'title') { text('LEVEL', W - 8, 4, '#aaa', 'right'); text(String(level), W - 8, 13, '#fff', 'right'); }
+
+    if (state === 'title') return drawTitle();
+
+    // 방어막
+    ctx.fillStyle = COLORS.shield;
+    for (const p of shields) if (p.alive) ctx.fillRect(p.x, p.y, 1, 1);
+
+    // 외계인
+    for (const a of aliens) if (a.alive) ctx.drawImage(sprite(a.type + (animFrame ? '2' : '1'), COLORS[a.type]), Math.round(a.x), Math.round(a.y));
+
+    // UFO
+    if (ufo) ctx.drawImage(sprite('ufo', COLORS.ufo), Math.round(ufo.x), ufo.y);
+
+    // 플레이어
+    if (state !== 'dying' && state !== 'over') ctx.drawImage(sprite('player', COLORS.player), Math.round(player.x), player.y);
+
+    // 총알
+    ctx.fillStyle = '#fff';
+    if (pBullet) ctx.fillRect(pBullet.x, pBullet.y, 1, 4);
+    for (const b of aBullets) {
+      const zig = Math.floor(b.y / 3) % 2;
+      ctx.fillStyle = b.style ? '#ff5' : '#fff';
+      for (let i = 0; i < 7; i++) {
+        const off = b.style ? ((Math.floor(b.y / 2) + i) % 3) : (i % 4 < 2 ? zig : 1 - zig) * 2;
+        ctx.fillRect(Math.round(b.x) + off, Math.round(b.y) + i, 1, 1);
+      }
+    }
+
+    // 폭발
+    for (const e of explosions) {
+      if (e.kind === 'boom') ctx.drawImage(sprite('boom', e.color), Math.round(e.x), Math.round(e.y));
+      else if (e.kind === 'small') {
+        ctx.fillStyle = e.color;
+        for (let i = 0; i < 8; i++) ctx.fillRect(e.x + Math.random() * 8, e.y + Math.random() * 6, 1, 1);
+      } else if (e.kind === 'text') text(e.text, e.x + 8, e.y, e.color, 'center');
+      else if (e.kind === 'player') {
+        ctx.fillStyle = frame % 10 < 5 ? COLORS.player : '#ff0';
+        for (let i = 0; i < 18; i++) ctx.fillRect(e.x + Math.random() * 12, e.y + 2 + Math.random() * 6, 1, 1);
+      }
+    }
+
+    // 바닥 + 남은 생명
+    ctx.fillStyle = COLORS.player; ctx.fillRect(0, GROUND, W, 1);
+    text(String(Math.max(lives, 0)), 8, GROUND + 5);
+    for (let i = 0; i < Math.min(lives - 1, 6); i++) ctx.drawImage(sprite('player', COLORS.player), 22 + i * 15, GROUND + 5);
+    if (muted) text('MUTE', W - 8, GROUND + 5, '#888', 'right');
+
+    // 오버레이
+    if (state === 'levelclear') { dim(); text(`LEVEL ${level} CLEAR!`, W / 2, 110, '#ff5', 'center', 12); text('다음 웨이브 준비...', W / 2, 130, '#fff', 'center'); }
+    if (state === 'paused') { dim(); text('일시정지', W / 2, 110, '#ff5', 'center', 12); text('P 키로 계속', W / 2, 130, '#fff', 'center'); }
+    if (state === 'over') {
+      dim();
+      text('GAME OVER', W / 2, 96, '#f33', 'center', 16);
+      text(`점수 ${score}`, W / 2, 122, '#fff', 'center');
+      if (score >= hiScore && score > 0) text('새 최고 기록!', W / 2, 136, '#ff5', 'center');
+      if (frame % 60 < 40) text('ENTER / 탭 으로 다시 시작', W / 2, 156, '#5ff', 'center');
+    }
+  }
+  function dim() { ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 80, W, 90); }
+
+  function drawTitle() {
+    text('INVADERS', W / 2, 42, '#3f3', 'center', 22);
+    const rows = [['ufo', COLORS.ufo, '= ? 미스터리'], ['a1', COLORS.a, '= 30 점'], ['b1', COLORS.b, '= 20 점'], ['c1', COLORS.c, '= 10 점']];
+    rows.forEach(([s, col, label], i) => {
+      const img = sprite(s, col);
+      ctx.drawImage(img, 78 - img.width / 2, 92 + i * 18);
+      text(label, 94, 92 + i * 18, '#fff');
+    });
+    text('← → / A D : 이동', W / 2, 176, '#aaa', 'center');
+    text('SPACE : 발사   P : 일시정지   M : 소리', W / 2, 188, '#aaa', 'center');
+    if (frame % 60 < 40) text('ENTER / 탭 으로 시작', W / 2, 212, '#ff5', 'center', 10);
+  }
+
+  // ===== 입력 =====
+  function startOrRestart() {
+    audio();
+    if (state === 'title' || state === 'over') { nextBonus = 10000; newGame(); }
+  }
+  addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    if (['arrowleft', 'arrowright', ' ', 'arrowup'].includes(k)) e.preventDefault();
+    if (k === 'arrowleft' || k === 'a') keys.left = true;
+    if (k === 'arrowright' || k === 'd') keys.right = true;
+    if (k === ' ' || k === 'arrowup' || k === 'w') { keys.fire = true; if (state === 'title' || state === 'over') startOrRestart(); }
+    if (k === 'enter') startOrRestart();
+    if (k === 'p' || k === 'escape') { if (state === 'play') state = 'paused'; else if (state === 'paused') state = 'play'; }
+    if (k === 'm') muted = !muted;
+  });
+  addEventListener('keyup', e => {
+    const k = e.key.toLowerCase();
+    if (k === 'arrowleft' || k === 'a') keys.left = false;
+    if (k === 'arrowright' || k === 'd') keys.right = false;
+    if (k === ' ' || k === 'arrowup' || k === 'w') keys.fire = false;
+  });
+  addEventListener('blur', () => { keys.left = keys.right = keys.fire = false; if (state === 'play') state = 'paused'; });
+
+  function bindTouch(id, key) {
+    const el = document.getElementById(id);
+    const on = e => { e.preventDefault(); keys[key] = true; if (key === 'fire') startOrRestart(); };
+    const off = e => { e.preventDefault(); keys[key] = false; };
+    el.addEventListener('pointerdown', on);
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => el.addEventListener(t, off));
+  }
+  bindTouch('left', 'left'); bindTouch('right', 'right'); bindTouch('fire', 'fire');
+  canvas.addEventListener('pointerdown', startOrRestart);
+
+  // ===== 메인 루프 (60fps 고정 스텝) =====
+  let last = performance.now(), acc = 0;
+  function loop(now) {
+    requestAnimationFrame(loop); // 오류가 나도 루프가 멈추지 않도록 먼저 예약
+    acc += Math.min(now - last, 100); last = now;
+    try {
+      while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+      draw();
+    } catch (err) { acc = 0; console.error(err); }
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
