@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>인베이더</title>
+<title>외계인침공</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; background: #000; overflow: hidden; }
@@ -389,7 +389,7 @@
   function dim() { ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 80, W, 90); }
 
   function drawTitle() {
-    text('INVADERS', W / 2, 42, '#3f3', 'center', 22);
+    text('외계인침공', W / 2, 42, '#3f3', 'center', 22);
     const rows = [['ufo', COLORS.ufo, '= ? 미스터리'], ['a1', COLORS.a, '= 30 점'], ['b1', COLORS.b, '= 20 점'], ['c1', COLORS.c, '= 10 점']];
     rows.forEach(([s, col, label], i) => {
       const img = sprite(s, col);
